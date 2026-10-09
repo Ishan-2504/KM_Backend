@@ -1,4 +1,4 @@
-"""Offline ingestion script: reads Excel, normalizes data, embeds composite text, uploads to Azure AI Search."""
+"""Offline ingestion: read Excel, embed composite text with Gemini, write FAISS + metadata."""
 
 import hashlib
 import sys
@@ -85,8 +85,8 @@ def ingest(file_path: str | None = None) -> int:
     ensure_index()
     records = load_records(file_path)
     client = get_search_client()
+    client.reset()
 
-    ids: list[str] = []
     documents: list[dict] = []
     texts_to_embed: list[str] = []
 
@@ -105,7 +105,6 @@ def ingest(file_path: str | None = None) -> int:
         for field in METADATA_FIELDS:
             doc[field] = rec.get(field) or ""
 
-        ids.append(doc_id)
         documents.append(doc)
         texts_to_embed.append(composite)
 
@@ -119,13 +118,10 @@ def ingest(file_path: str | None = None) -> int:
     for i, doc in enumerate(documents):
         doc["embedding"] = all_embeddings[i]
 
-    print(f"Uploading {len(documents)} documents to Azure AI Search...")
+    print(f"Uploading {len(documents)} documents to FAISS...")
     for i in tqdm(range(0, len(documents), UPLOAD_CHUNK), desc="Uploading"):
         chunk = documents[i : i + UPLOAD_CHUNK]
-        result = client.upload_documents(documents=chunk)
-        failed = [r for r in result if not r.succeeded]
-        if failed:
-            print(f"  WARNING: {len(failed)} documents failed in batch starting at {i}")
+        client.upload_documents(chunk)
 
     count = client.get_document_count()
     print(f"Ingestion complete. Index now has {count} documents.")

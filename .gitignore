@@ -42,7 +42,10 @@ pnpm-debug.log*
 
 # Local databases and generated data
 backend/app/db/chroma_data/
+app/db/chroma_data/
+app/db/indices/
 **/chroma_data/
+**/indices/
 data/*.xlsx
 data/*.xls
 data/*.csv

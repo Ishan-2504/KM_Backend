@@ -1,4 +1,4 @@
-"""Unified search pipeline using Gemini AI Search with hybrid retrieval and semantic ranking."""
+"""Unified search pipeline using Gemini embeddings, FAISS retrieval, and score fusion."""
 
 from __future__ import annotations
 
@@ -7,16 +7,14 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from google import genai
-
 from app.db.search_client import get_search_client
 from app.models import (
-    FILTERABLE_FIELDS,
     PaginatedSearchResponse,
     SearchFilters,
     SearchMoreRequest,
     SearchRequest,
     SearchResult,
+    active_filter_dict,
 )
 from app.services.embeddings import embed_single
 from app.services.filter_extractor import ExtractionResult, extract_filters
@@ -26,7 +24,6 @@ from app.services.search_logger import new_search_log, step_ms, timed_step
 TIER_THRESHOLDS = [63.5, 60.0, 55.5]
 RELEVANCE_FLOOR = 55.5
 SESSION_TTL = 600
-MAX_FETCH = 500
 
 ALL_SELECT_FIELDS = [
     "id", "document_name", "summary", "document_type", "designation",
@@ -35,26 +32,8 @@ ALL_SELECT_FIELDS = [
 ]
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-
-def _build_odata_filter(filters: SearchFilters) -> str | None:
-    """Build an OData filter string from non-empty filter fields."""
-    clauses = []
-    for field in FILTERABLE_FIELDS:
-        value = getattr(filters, field, None)
-        if value:
-            escaped = value.replace("'", "''")
-            clauses.append(f"{field} eq '{escaped}'")
-
-    if not clauses:
-        return None
-    return " and ".join(clauses)
-
-
 def _has_active_filters(filters: SearchFilters | None) -> bool:
-    if not filters:
-        return False
-    return any(getattr(filters, f, None) for f in FILTERABLE_FIELDS)
+    return bool(active_filter_dict(filters))
 
 
 def _resolve_mode(query: str, has_manual_filters: bool, has_extracted_filters: bool) -> str:
@@ -68,17 +47,10 @@ def _resolve_mode(query: str, has_manual_filters: bool, has_extracted_filters: b
     return "none"
 
 
-def _result_from_gemini(hit: dict, rank: int = 0, fused_score: float | None = None) -> SearchResult:
-    """Convert a Gemini AI Search result into a SearchResult."""
+def _result_from_hit(hit: dict, rank: int = 0, fused_score: float | None = None) -> SearchResult:
     similarity = fused_score
-    if similarity is None:
-        reranker = hit.get("@search.reranker_score")
-        if reranker is not None:
-            similarity = round(reranker / 4.0, 4)
-        else:
-            score = hit.get("@search.score")
-            if score is not None:
-                similarity = round(score, 4)
+    if similarity is None and hit.get("_score") is not None:
+        similarity = round(float(hit["_score"]), 4)
 
     return SearchResult(
         document_name=hit.get("document_name", ""),
@@ -100,14 +72,12 @@ def _result_from_gemini(hit: dict, rank: int = 0, fused_score: float | None = No
     )
 
 
-# ── Score Fusion ────────────────────────────────────────────────────────────
-
 def _compute_fused_score(
     base_score: float,
     hit: dict,
     extraction: ExtractionResult,
 ) -> float:
-    """Combine Gemini search score with metadata-alignment boost.
+    """Combine cosine similarity with metadata-alignment boost.
 
     finalScore = baseScore * 0.7 + metadataBoost * 0.3
     """
@@ -133,86 +103,26 @@ def _compute_fused_score(
     return base_score * 0.7 + normalised * 0.3
 
 
-# ── Filter-Only Search ──────────────────────────────────────────────────────
-
 def _filter_only_search(
     filters: SearchFilters,
     top_k: int,
 ) -> list[SearchResult]:
     client = get_search_client()
-    odata_filter = _build_odata_filter(filters)
-
-    results = client.search(
-        search_text="*",
-        filter=odata_filter,
+    hits = client.search(
+        filters=active_filter_dict(filters),
         select=ALL_SELECT_FIELDS,
-        top=top_k,
+        top_k=top_k,
     )
 
-    output: list[SearchResult] = []
-    for hit in results:
-        output.append(_result_from_gemini(hit))
-
-    output.sort(key=lambda r: r.year or "0000", reverse=True)
-    for i, r in enumerate(output):
-        r.rank = i + 1
+    output = [_result_from_hit(hit) for hit in hits]
+    for i, result in enumerate(output):
+        result.rank = i + 1
     return output
 
 
-# ── Score Calibration ────────────────────────────────────────────────────────
-
-def _calibrate_hits(hits: list[dict]) -> None:
-    """Add ``_calibrated_score`` (0-1) to every hit using linear regression.
-
-    Results with a semantic reranker score keep their normalised reranker value.
-    For results without one, we map their RRF ``@search.reranker_ score`` onto the
-    reranker scale using the ~50 overlap data-points that have both scores.
-    """
-    pairs: list[tuple[float, float]] = []
-    for h in hits:
-        reranker = h.get("@search.reranker_score")
-        rrf = h.get("@search.score", 0.0)
-        if reranker is not None:
-            pairs.append((rrf, reranker / 4.0))
-
-    if len(pairs) < 2:
-        for h in hits:
-            reranker = h.get("@search.reranker_score")
-            if reranker is not None:
-                h["_calibrated_score"] = reranker / 4.0
-            else:
-                h["_calibrated_score"] = h.get("@search.score", 0.0)
-        return
-
-    n = len(pairs)
-    sum_x = sum(p[0] for p in pairs)
-    sum_y = sum(p[1] for p in pairs)
-    sum_xy = sum(p[0] * p[1] for p in pairs)
-    sum_xx = sum(p[0] ** 2 for p in pairs)
-
-    denom = n * sum_xx - sum_x ** 2
-    if denom == 0:
-        slope, intercept = 0.0, sum_y / n
-    else:
-        slope = (n * sum_xy - sum_x * sum_y) / denom
-        intercept = (sum_y - slope * sum_x) / n
-
-    cap = min(p[1] for p in pairs)
-
-    for h in hits:
-        if h.get("@search.reranker_score") is not None:
-            h["_calibrated_score"] = h["@search.reranker_score"] / 4.0
-        else:
-            estimated = slope * h.get("@search.score", 0.0) + intercept
-            h["_calibrated_score"] = max(0.0, min(estimated, cap))
-
-
 def _fused_to_relevance_pct(fused: float) -> float:
-    """Convert a 0-1 fused score to a 0-100 relevance percentage."""
     return round(max(0.0, min(fused * 100.0, 100.0)), 1)
 
-
-# ── Vector / Hybrid Search ──────────────────────────────────────────────────
 
 def _vector_search(
     query: str,
@@ -222,76 +132,48 @@ def _vector_search(
     similarity_threshold: float,
 ) -> list[SearchResult]:
     client = get_search_client()
-    odata_filter = _build_odata_filter(filters) if filters else None
-
     query_embedding = embed_single(query)
-
-    vector_query = genai.VectorQuery(
-        vector=query_embedding,
-        k_nearest_neighbors=top_k,
-        fields="embedding",
-        filter_mode="pre_filter",
-    )
-
-    results = client.search(
-        search_text=query,
-        vector_queries=[vector_query],
-        filter=odata_filter,
+    hits = client.search(
+        query_vector=query_embedding,
+        filters=active_filter_dict(filters) or None,
         select=ALL_SELECT_FIELDS,
-        top=top_k,
-        query_type="semantic",
-        semantic_configuration_name="semantic-config",
+        top_k=top_k,
     )
 
-    raw_hits = list(results)
-    _calibrate_hits(raw_hits)
-
+    score_floor = 1.0 - similarity_threshold
     output: list[SearchResult] = []
-    for hit in raw_hits:
-        base_score = hit["_calibrated_score"]
-
-        if base_score < (1.0 - similarity_threshold):
+    for hit in hits:
+        base_score = float(hit.get("_score") or 0.0)
+        if base_score < score_floor:
             continue
-
         fused = _compute_fused_score(base_score, hit, extraction)
-        sr = _result_from_gemini(hit, fused_score=fused)
-        sr.relevance_pct = _fused_to_relevance_pct(fused)
-        output.append(sr)
+        result = _result_from_hit(hit, fused_score=fused)
+        result.relevance_pct = _fused_to_relevance_pct(fused)
+        output.append(result)
 
     output.sort(key=lambda r: r.similarity_score or 0, reverse=True)
-    for i, r in enumerate(output):
-        r.rank = i + 1
+    for i, result in enumerate(output):
+        result.rank = i + 1
     return output
 
-
-# ── Unified Entry Point ─────────────────────────────────────────────────────
 
 def execute_search(request: SearchRequest) -> list[SearchResult]:
     """Unified search pipeline: expand -> extract -> route -> search -> fuse -> return."""
     total_start = time.perf_counter()
     raw_query = request.query or ""
 
-    manual_filters_dict: dict = {}
-    if request.filters:
-        manual_filters_dict = {
-            k: v for k, v in request.filters.model_dump().items() if v
-        }
+    manual_filters_dict = active_filter_dict(request.filters) or None
+    slog = new_search_log(raw_query, manual_filters_dict)
 
-    slog = new_search_log(raw_query, manual_filters_dict or None)
-
-    # ── Step 1: Query Expansion ─────────────────────────────────────────
     with timed_step("QUERY EXPANSION") as s1:
         expanded_query = expand_query(raw_query)
         s1["input"] = raw_query
         s1["output"] = expanded_query
     slog.add_step("QUERY EXPANSION", step_ms(s1), input=raw_query, output=expanded_query)
 
-    # ── Step 2: Filter Extraction ───────────────────────────────────────
     with timed_step("FILTER EXTRACTION") as s2:
         extraction = extract_filters(expanded_query, request.filters)
-        extracted_dict = {
-            k: v for k, v in extraction.filters.model_dump().items() if v
-        }
+        extracted_dict = active_filter_dict(extraction.filters)
         s2["extracted_filters"] = extracted_dict
         s2["semantic_query"] = extraction.semantic_query
     slog.add_step(
@@ -300,7 +182,6 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
         semantic_query=extraction.semantic_query,
     )
 
-    # ── Step 3: Mode Resolution ─────────────────────────────────────────
     with timed_step("MODE RESOLUTION") as s3:
         has_manual = _has_active_filters(request.filters)
         has_extracted = _has_active_filters(extraction.filters)
@@ -317,7 +198,6 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
         s3["reason"] = reason
     slog.add_step("MODE RESOLUTION", step_ms(s3), mode=mode, reason=reason)
 
-    # ── Step 4: Execute Search ──────────────────────────────────────────
     if mode == "none":
         slog.add_step("SEARCH", 0.0, result="skipped (no inputs)")
         slog.result_count = 0
@@ -328,7 +208,7 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
     with timed_step("SEARCH") as s4:
         if mode == "filter_only":
             results = _filter_only_search(extraction.filters, request.top_k)
-            s4["type"] = "metadata-only (Gemini AI Search filter)"
+            s4["type"] = "metadata-only (FAISS metadata filter)"
             s4["candidate_pool"] = len(results)
             s4["threshold"] = "N/A"
             s4["passing"] = len(results)
@@ -342,7 +222,7 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
                 top_k=request.top_k,
                 similarity_threshold=request.similarity_threshold,
             )
-            s4["type"] = f"hybrid+semantic ({mode})"
+            s4["type"] = f"hybrid+vector ({mode})"
             s4["semantic_query"] = semantic_q
             s4["filter_clause"] = extracted_dict or "(none)"
             s4["threshold"] = f"score >= {round(1 - request.similarity_threshold, 2)}"
@@ -350,7 +230,6 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
 
     slog.add_step("SEARCH", step_ms(s4), **{k: v for k, v in s4.items()})
 
-    # ── Step 5: Score Fusion Summary ────────────────────────────────────
     if results and results[0].similarity_score is not None:
         with timed_step("SCORE FUSION SUMMARY") as s5:
             scores = [r.similarity_score for r in results if r.similarity_score is not None]
@@ -366,18 +245,8 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
     return results
 
 
-# ── Relevance Tiers ──────────────────────────────────────────────────────────
-
 def _split_into_tiers(results: list[SearchResult]) -> list[list[SearchResult]]:
-    """Partition results into relevance-based tiers for progressive disclosure.
-
-    Tier 0: relevance_pct is None (filter-only) or >= TIER_THRESHOLDS[0]
-    Tier 1: TIER_THRESHOLDS[1] <= relevance_pct < TIER_THRESHOLDS[0]
-    Tier 2: TIER_THRESHOLDS[2] <= relevance_pct < TIER_THRESHOLDS[1]
-
-    If tier 0 would be empty (best scored result < TIER_THRESHOLDS[0]),
-    all results are collapsed into tier 0 so the user sees them immediately.
-    """
+    """Partition results into relevance-based tiers for progressive disclosure."""
     tier_count = len(TIER_THRESHOLDS)
     buckets: list[list[SearchResult]] = [[] for _ in range(tier_count)]
 
@@ -403,8 +272,6 @@ def _split_into_tiers(results: list[SearchResult]) -> list[list[SearchResult]]:
     return [b for b in buckets if b]
 
 
-# ── Session Cache ────────────────────────────────────────────────────────────
-
 @dataclass
 class _SearchSession:
     tiers: list[list[SearchResult]]
@@ -424,7 +291,6 @@ def _cleanup_sessions() -> None:
 
 
 def _store_session(results: list[SearchResult]) -> tuple[str, int]:
-    """Cache a tiered result set and return (session_id, total_relevant)."""
     tiers = _split_into_tiers(results)
     total_relevant = sum(len(t) for t in tiers)
     session_id = uuid.uuid4().hex[:16]
@@ -438,10 +304,7 @@ def _store_session(results: list[SearchResult]) -> tuple[str, int]:
     return session_id, total_relevant
 
 
-# ── Paginated Search ─────────────────────────────────────────────────────────
-
 def execute_search_paginated(request: SearchRequest) -> tuple[list[SearchResult], str, bool, int]:
-    """Run the full pipeline and return (first_page, session_id, has_more, total_relevant)."""
     all_results = execute_search(request)
     session_id, total_relevant = _store_session(all_results)
 
@@ -456,10 +319,6 @@ def execute_search_paginated(request: SearchRequest) -> tuple[list[SearchResult]
 
 
 def get_search_page(request: SearchMoreRequest) -> PaginatedSearchResponse:
-    """Return the next relevance tier from a cached session.
-
-    page=2 maps to tier index 1, page=3 to tier index 2, etc.
-    """
     with _sessions_lock:
         session = _sessions.get(request.session_id)
 

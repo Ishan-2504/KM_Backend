@@ -8,15 +8,10 @@ from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from google import genai
+from google.genai import types
 from sse_starlette.sse import EventSourceResponse
 
-from app.config import (
-    GEMINI_API_KEY,
-    GEMINI_CHAT_MODEL,
-    GEMINI_EMBEDDING_MODEL,
-    VECTOR_INDEX_NAME,
-    DATA_FILE_PATH,
-)
+from app.config import GEMINI_API_KEY, GEMINI_CHAT_MODEL
 from app.db.search_client import ensure_index, get_search_client
 from app.models import (
     FILTERABLE_FIELDS,
@@ -27,6 +22,7 @@ from app.models import (
     SearchFilters,
     SearchMoreRequest,
     SearchRequest,
+    active_filter_dict,
 )
 from app.services.embeddings import embed_single
 from app.services.search import execute_search_paginated, get_search_page
@@ -62,34 +58,9 @@ async def health():
 
 
 async def _fetch_filter_options(active_filters: SearchFilters | None = None) -> FilterOptions:
-    """Return faceted filter options, optionally narrowed by active selections.
-
-    When *active_filters* carries one or more non-empty values the Google Gemini Search
-    query is constrained to matching rows, so the returned facets only contain
-    values that co-exist with the current selection — enabling cascading filters.
-    """
+    """Return faceted filter options, optionally narrowed by active selections."""
     client = get_search_client()
-
-    odata_filter = None
-    if active_filters:
-        clauses = []
-        for field in FILTERABLE_FIELDS:
-            value = getattr(active_filters, field, None)
-            if value:
-                escaped = value.replace("'", "''")
-                clauses.append(f"{field} eq '{escaped}'")
-        if clauses:
-            odata_filter = " and ".join(clauses)
-
-    facet_specs = [f"{field},count:1000" for field in FILTERABLE_FIELDS]
-    results = client.search(
-        search_text="*",
-        facets=facet_specs,
-        filter=odata_filter,
-        top=0,
-    )
-
-    facets = results.get_facets() or {}
+    facets = client.get_facets(active_filter_dict(active_filters) or None)
 
     options: dict[str, list[str]] = {}
     for field in FILTERABLE_FIELDS:
@@ -198,43 +169,20 @@ RAG_TOP_K = 10
 MAX_FILE_TEXT_CHARS = 6000
 
 
-def _build_doc_name_filter(document_names: list[str]) -> str:
-    """Build an OData filter that restricts results to the given document names."""
-    clauses = []
-    for name in document_names:
-        escaped = name.replace("'", "''")
-        clauses.append(f"document_name eq '{escaped}'")
-    return " or ".join(clauses)
-
-
 def _retrieve_for_chat(question: str, document_names: list[str]) -> list[dict]:
-    """RAG retrieval: embed the question and search Gemini AI Search scoped to document_names."""
+    """RAG retrieval: embed the question and search FAISS, optionally scoped to document names."""
     client = get_search_client()
-
     query_embedding = embed_single(question)
-
-    vector_query = VectorizedQuery(
-        vector=query_embedding,
-        k_nearest_neighbors=RAG_TOP_K,
-        fields="embedding",
-    )
-
-    odata_filter = _build_doc_name_filter(document_names) if document_names else None
+    filters = {"document_name": document_names} if document_names else None
 
     results = client.search(
-        search_text=question,
-        vector_queries=[vector_query],
-        filter=odata_filter,
+        query_vector=query_embedding,
+        filters=filters,
         select=RAG_SELECT_FIELDS,
-        top=RAG_TOP_K,
-        query_type="semantic",
-        semantic_configuration_name="semantic-config",
+        top_k=RAG_TOP_K,
     )
 
-    retrieved: list[dict] = []
-    for hit in results:
-        retrieved.append({field: hit.get(field, "") for field in RAG_SELECT_FIELDS})
-    return retrieved
+    return [{field: hit.get(field, "") for field in RAG_SELECT_FIELDS} for hit in results]
 
 
 def _build_rag_context(docs: list[dict]) -> str:
@@ -306,9 +254,34 @@ def _build_ranked_list_text(ranked_list: list[RankedDocument]) -> str:
 
 
 def _get_gemini_client() -> genai.Client:
-    return genai.Client(
-        api_key=GEMINI_API_KEY
-    )
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+def _to_gemini_contents(messages: list) -> list[types.Content]:
+    contents: list[types.Content] = []
+
+    for message in messages:
+        if message.role not in ("user", "assistant"):
+            continue
+
+        role = "user" if message.role == "user" else "model"
+
+        contents.append(
+            types.Content(
+                role=role,
+                parts=[
+                    types.Part.from_text(
+                        text=message.content
+                    )
+                ],
+            )
+        )
+
+    # Gemini requires the conversation to end with a user message
+    if contents and contents[-1].role == "model":
+        contents.pop()
+
+    return contents
 
 
 async def _chat_stream_generator(request: ChatRequest):
@@ -323,30 +296,24 @@ async def _chat_stream_generator(request: ChatRequest):
 
     ranked_text = _build_ranked_list_text(request.ranked_list)
     context = _build_rag_context(retrieved_docs)
-    system_msg = {
-        "role": "system",
-        "content": CHAT_SYSTEM_PROMPT.format(ranked_list=ranked_text, documents=context),
-    }
-    conversation = [system_msg] + [
-        {"role": m.role, "content": m.content}
-        for m in request.messages
-        if m.role in ("user", "assistant")
-    ]
+    system_text = CHAT_SYSTEM_PROMPT.format(ranked_list=ranked_text, documents=context)
+    contents = _to_gemini_contents(request.messages)
 
     client = _get_gemini_client()
 
     def _call_gemini():
         return client.models.generate_content_stream(
             model=GEMINI_CHAT_MODEL,
-            contents=conversation,
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=system_text),
         )
 
     try:
         stream = await loop.run_in_executor(None, _call_gemini)
         for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                yield f"data: {json.dumps({'token': token})}\n\n"
+            text = getattr(chunk, "text", None)
+            if text:
+                yield f"data: {json.dumps({'token': text})}\n\n"
         yield f"data: {json.dumps({'done': True})}\n\n"
     except Exception as e:
         logging.error("Chat stream error: %s", e)

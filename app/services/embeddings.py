@@ -1,9 +1,6 @@
 from google import genai
 
-from app.config import (
-    GEMINI_API_KEY,
-    GEMINI_EMBEDDING_MODEL,
-)
+from app.config import GEMINI_API_KEY, GEMINI_EMBEDDING_MODEL
 
 _client: genai.Client | None = None
 
@@ -13,25 +10,23 @@ BATCH_SIZE = 20
 def get_gemini_client() -> genai.Client:
     global _client
     if _client is None:
-        _client = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
+        _client = genai.Client(api_key=GEMINI_API_KEY)
     return _client
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a list of texts in batches, returning one embedding per text."""
+    """Embed texts one at a time so Gemini does not collapse a batch into one vector."""
     client = get_gemini_client()
     all_embeddings: list[list[float]] = []
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i : i + BATCH_SIZE]
-        response = client.models.embed(
+    for text in texts:
+        response = client.models.embed_content(
             model=GEMINI_EMBEDDING_MODEL,
-            contents=batch,
+            contents=text or " ",
         )
-        batch_embeddings = [item.values for item in response.data]
-        all_embeddings.extend(batch_embeddings)
+        if not response.embeddings:
+            raise RuntimeError("Gemini embed_content returned no embeddings")
+        all_embeddings.append(list(response.embeddings[0].values))
 
     return all_embeddings
 

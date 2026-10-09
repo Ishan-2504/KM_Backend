@@ -103,6 +103,12 @@ class SearchFilters(BaseModel):
     year: Optional[str] = None
 
 
+def active_filter_dict(filters: SearchFilters | None) -> dict[str, str]:
+    if not filters:
+        return {}
+    return {k: v for k, v in filters.model_dump().items() if v}
+
+
 class SearchRequest(BaseModel):
     query: str = ""
     filters: Optional[SearchFilters] = None
