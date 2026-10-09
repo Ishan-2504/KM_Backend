@@ -7,16 +7,15 @@ from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from openai import AzureOpenAI
+from google import genai
 from sse_starlette.sse import EventSourceResponse
 
-from azure.search.documents.models import VectorizedQuery
-
 from app.config import (
-    AZURE_OPENAI_API_KEY,
-    AZURE_OPENAI_API_VERSION,
-    AZURE_OPENAI_CHAT_DEPLOYMENT,
-    AZURE_OPENAI_ENDPOINT,
+    GEMINI_API_KEY,
+    GEMINI_CHAT_MODEL,
+    GEMINI_EMBEDDING_MODEL,
+    VECTOR_INDEX_NAME,
+    DATA_FILE_PATH,
 )
 from app.db.search_client import ensure_index, get_search_client
 from app.models import (
@@ -65,7 +64,7 @@ async def health():
 async def _fetch_filter_options(active_filters: SearchFilters | None = None) -> FilterOptions:
     """Return faceted filter options, optionally narrowed by active selections.
 
-    When *active_filters* carries one or more non-empty values the Azure Search
+    When *active_filters* carries one or more non-empty values the Google Gemini Search
     query is constrained to matching rows, so the returned facets only contain
     values that co-exist with the current selection — enabling cascading filters.
     """
@@ -209,7 +208,7 @@ def _build_doc_name_filter(document_names: list[str]) -> str:
 
 
 def _retrieve_for_chat(question: str, document_names: list[str]) -> list[dict]:
-    """RAG retrieval: embed the question and search Azure AI Search scoped to document_names."""
+    """RAG retrieval: embed the question and search Gemini AI Search scoped to document_names."""
     client = get_search_client()
 
     query_embedding = embed_single(question)
@@ -306,11 +305,9 @@ def _build_ranked_list_text(ranked_list: list[RankedDocument]) -> str:
     return "\n".join(lines)
 
 
-def _get_openai_client() -> AzureOpenAI:
-    return AzureOpenAI(
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version=AZURE_OPENAI_API_VERSION,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+def _get_gemini_client() -> genai.Client:
+    return genai.Client(
+        api_key=GEMINI_API_KEY
     )
 
 
@@ -336,19 +333,16 @@ async def _chat_stream_generator(request: ChatRequest):
         if m.role in ("user", "assistant")
     ]
 
-    client = _get_openai_client()
+    client = _get_gemini_client()
 
-    def _call_openai():
-        return client.chat.completions.create(
-            model=AZURE_OPENAI_CHAT_DEPLOYMENT,
-            messages=conversation,
-            stream=True,
-            temperature=0.3,
-            max_tokens=1024,
+    def _call_gemini():
+        return client.models.generate_content_stream(
+            model=GEMINI_CHAT_MODEL,
+            contents=conversation,
         )
 
     try:
-        stream = await loop.run_in_executor(None, _call_openai)
+        stream = await loop.run_in_executor(None, _call_gemini)
         for chunk in stream:
             if chunk.choices and chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content

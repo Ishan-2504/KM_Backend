@@ -6,17 +6,15 @@ semantic query, using the known canonical values for each field.
 
 import json
 
-from openai import AzureOpenAI
+from google import genai
 
 from app.config import (
-    AZURE_OPENAI_API_KEY,
-    AZURE_OPENAI_API_VERSION,
-    AZURE_OPENAI_CHAT_DEPLOYMENT,
-    AZURE_OPENAI_ENDPOINT,
+    GEMINI_API_KEY,
+    GEMINI_CHAT_MODEL,
 )
 from app.models import QueryDecomposition, SearchFilters
 
-_chat_client: AzureOpenAI | None = None
+_chat_client: genai.Client | None = None
 
 CANONICAL_VALUES = {
     "document_type": ["bio", "knowledge_library"],
@@ -135,13 +133,11 @@ Output JSON schema:
 Only include filter keys that have a value. Omit keys with null/empty values."""
 
 
-def _get_chat_client() -> AzureOpenAI:
+def _get_chat_client() -> genai.Client:
     global _chat_client
     if _chat_client is None:
-        _chat_client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            api_version=AZURE_OPENAI_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        _chat_client = genai.Client(
+            api_key=GEMINI_API_KEY
         )
     return _chat_client
 
@@ -155,8 +151,8 @@ def decompose_query(query: str) -> QueryDecomposition:
     system_msg = SYSTEM_PROMPT.format(canonical_json=json.dumps(CANONICAL_VALUES, indent=2))
 
     try:
-        response = client.chat.completions.create(
-            model=AZURE_OPENAI_CHAT_DEPLOYMENT,
+        response = client.models.generate_content_stream(
+            model=GEMINI_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": query},

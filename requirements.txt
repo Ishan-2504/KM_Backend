@@ -1,9 +1,10 @@
 fastapi
 uvicorn[standard]
-azure-search-documents
-openai
 openpyxl
 sse-starlette
 python-dotenv
 pydantic
 tqdm
+google-genai
+faiss-cpu 
+pandas

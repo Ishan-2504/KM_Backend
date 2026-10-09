@@ -1,4 +1,4 @@
-"""Unified search pipeline using Azure AI Search with hybrid retrieval and semantic ranking."""
+"""Unified search pipeline using Gemini AI Search with hybrid retrieval and semantic ranking."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from azure.search.documents.models import VectorFilterMode, VectorizedQuery
+from google import genai
 
 from app.db.search_client import get_search_client
 from app.models import (
@@ -68,8 +68,8 @@ def _resolve_mode(query: str, has_manual_filters: bool, has_extracted_filters: b
     return "none"
 
 
-def _result_from_azure(hit: dict, rank: int = 0, fused_score: float | None = None) -> SearchResult:
-    """Convert an Azure AI Search result into a SearchResult."""
+def _result_from_gemini(hit: dict, rank: int = 0, fused_score: float | None = None) -> SearchResult:
+    """Convert a Gemini AI Search result into a SearchResult."""
     similarity = fused_score
     if similarity is None:
         reranker = hit.get("@search.reranker_score")
@@ -107,7 +107,7 @@ def _compute_fused_score(
     hit: dict,
     extraction: ExtractionResult,
 ) -> float:
-    """Combine Azure search score with metadata-alignment boost.
+    """Combine Gemini search score with metadata-alignment boost.
 
     finalScore = baseScore * 0.7 + metadataBoost * 0.3
     """
@@ -151,7 +151,7 @@ def _filter_only_search(
 
     output: list[SearchResult] = []
     for hit in results:
-        output.append(_result_from_azure(hit))
+        output.append(_result_from_gemini(hit))
 
     output.sort(key=lambda r: r.year or "0000", reverse=True)
     for i, r in enumerate(output):
@@ -165,7 +165,7 @@ def _calibrate_hits(hits: list[dict]) -> None:
     """Add ``_calibrated_score`` (0-1) to every hit using linear regression.
 
     Results with a semantic reranker score keep their normalised reranker value.
-    For results without one, we map their RRF ``@search.score`` onto the
+    For results without one, we map their RRF ``@search.reranker_ score`` onto the
     reranker scale using the ~50 overlap data-points that have both scores.
     """
     pairs: list[tuple[float, float]] = []
@@ -226,11 +226,11 @@ def _vector_search(
 
     query_embedding = embed_single(query)
 
-    vector_query = VectorizedQuery(
+    vector_query = genai.VectorQuery(
         vector=query_embedding,
         k_nearest_neighbors=top_k,
         fields="embedding",
-        filter_mode=VectorFilterMode.PRE_FILTER,
+        filter_mode="pre_filter",
     )
 
     results = client.search(
@@ -254,7 +254,7 @@ def _vector_search(
             continue
 
         fused = _compute_fused_score(base_score, hit, extraction)
-        sr = _result_from_azure(hit, fused_score=fused)
+        sr = _result_from_gemini(hit, fused_score=fused)
         sr.relevance_pct = _fused_to_relevance_pct(fused)
         output.append(sr)
 
@@ -328,7 +328,7 @@ def execute_search(request: SearchRequest) -> list[SearchResult]:
     with timed_step("SEARCH") as s4:
         if mode == "filter_only":
             results = _filter_only_search(extraction.filters, request.top_k)
-            s4["type"] = "metadata-only (Azure AI Search filter)"
+            s4["type"] = "metadata-only (Gemini AI Search filter)"
             s4["candidate_pool"] = len(results)
             s4["threshold"] = "N/A"
             s4["passing"] = len(results)

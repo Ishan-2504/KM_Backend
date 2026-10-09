@@ -1,40 +1,36 @@
-from openai import AzureOpenAI
+from google import genai
 
 from app.config import (
-    AZURE_OPENAI_API_KEY,
-    AZURE_OPENAI_EMBEDDINGS_API_VERSION,
-    AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT,
-    AZURE_OPENAI_ENDPOINT,
+    GEMINI_API_KEY,
+    GEMINI_EMBEDDING_MODEL,
 )
 
-_client: AzureOpenAI | None = None
+_client: genai.Client | None = None
 
 BATCH_SIZE = 20
 
 
-def get_openai_client() -> AzureOpenAI:
+def get_gemini_client() -> genai.Client:
     global _client
     if _client is None:
-        _client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            api_version=AZURE_OPENAI_EMBEDDINGS_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        _client = genai.Client(
+            api_key=GEMINI_API_KEY
         )
     return _client
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """Embed a list of texts in batches, returning one embedding per text."""
-    client = get_openai_client()
+    client = get_gemini_client()
     all_embeddings: list[list[float]] = []
 
     for i in range(0, len(texts), BATCH_SIZE):
         batch = texts[i : i + BATCH_SIZE]
-        response = client.embeddings.create(
-            input=batch,
-            model=AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT,
+        response = client.models.embed(
+            model=GEMINI_EMBEDDING_MODEL,
+            contents=batch,
         )
-        batch_embeddings = [item.embedding for item in response.data]
+        batch_embeddings = [item.values for item in response.data]
         all_embeddings.extend(batch_embeddings)
 
     return all_embeddings
