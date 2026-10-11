@@ -4,7 +4,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from google import genai
@@ -147,15 +147,6 @@ async def search_sync(request: SearchRequest):
         "session_id": session_id,
         "has_more": has_more,
     }
-
-
-@app.post("/api/ingest")
-async def ingest_data(background_tasks: BackgroundTasks):
-    """Trigger data re-ingestion from the Excel file."""
-    from app.services.ingestion import ingest
-
-    background_tasks.add_task(ingest)
-    return {"status": "ingestion_started"}
 
 
 RAG_SELECT_FIELDS = [

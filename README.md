@@ -165,8 +165,6 @@ App URLs:
   Streaming search endpoint using SSE.
 - `POST /api/search/sync`
   Non-streaming search endpoint.
-- `POST /api/ingest`
-  Triggers background data ingestion.
 
 ## Data Model And Filters
 
