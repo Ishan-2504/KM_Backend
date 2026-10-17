@@ -12,7 +12,8 @@ from google.genai import types
 from sse_starlette.sse import EventSourceResponse
 
 from app.config import GEMINI_API_KEY, GEMINI_CHAT_MODEL
-from app.db.search_client import ensure_index, get_search_client
+from app.db.search_client import ensure_index
+from app.indexing.factory import get_search_backend
 from app.models import (
     FILTERABLE_FIELDS,
     ChatRequest,
@@ -24,7 +25,7 @@ from app.models import (
     SearchRequest,
     active_filter_dict,
 )
-from app.services.embeddings import embed_single
+from app.indexing.factory import get_search_backend
 from app.services.search import execute_search_paginated, get_search_page
 
 logging.basicConfig(
@@ -52,15 +53,19 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health():
-    client = get_search_client()
-    count = client.get_document_count()
-    return {"status": "ok", "document_count": count}
+    backend = get_search_backend()
+    count = backend.get_document_count()
+    return {
+        "status": "ok",
+        "document_count": count,
+        "search_backend": backend.name,
+    }
 
 
 async def _fetch_filter_options(active_filters: SearchFilters | None = None) -> FilterOptions:
     """Return faceted filter options, optionally narrowed by active selections."""
-    client = get_search_client()
-    facets = client.get_facets(active_filter_dict(active_filters) or None)
+    backend = get_search_backend()
+    facets = backend.get_facets(active_filter_dict(active_filters) or None)
 
     options: dict[str, list[str]] = {}
     for field in FILTERABLE_FIELDS:
@@ -161,13 +166,13 @@ MAX_FILE_TEXT_CHARS = 6000
 
 
 def _retrieve_for_chat(question: str, document_names: list[str]) -> list[dict]:
-    """RAG retrieval: embed the question and search FAISS, optionally scoped to document names."""
-    client = get_search_client()
-    query_embedding = embed_single(question)
+    """RAG retrieval: run a semantic query against the active backend,
+    optionally scoped to document names."""
+    backend = get_search_backend()
     filters = {"document_name": document_names} if document_names else None
 
-    results = client.search(
-        query_vector=query_embedding,
+    results = backend.search(
+        query=question,
         filters=filters,
         select=RAG_SELECT_FIELDS,
         top_k=RAG_TOP_K,

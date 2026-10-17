@@ -1,0 +1,1 @@
+"""ETL package: folder discovery, text extraction, routing, and canonical output."""

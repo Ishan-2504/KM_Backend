@@ -7,7 +7,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from app.db.search_client import get_search_client
+from app.config import RANKING_RELEVANCE_FLOOR, RANKING_TIER_THRESHOLDS
+from app.indexing.factory import get_search_backend
 from app.models import (
     PaginatedSearchResponse,
     SearchFilters,
@@ -16,13 +17,12 @@ from app.models import (
     SearchResult,
     active_filter_dict,
 )
-from app.services.embeddings import embed_single
 from app.services.filter_extractor import ExtractionResult, extract_filters
 from app.services.query_expander import expand_query
 from app.services.search_logger import new_search_log, step_ms, timed_step
 
-TIER_THRESHOLDS = [63.5, 60.0, 55.5]
-RELEVANCE_FLOOR = 55.5
+TIER_THRESHOLDS = RANKING_TIER_THRESHOLDS or [63.5, 60.0, 55.5]
+RELEVANCE_FLOOR = RANKING_RELEVANCE_FLOOR
 SESSION_TTL = 600
 
 ALL_SELECT_FIELDS = [
@@ -107,8 +107,9 @@ def _filter_only_search(
     filters: SearchFilters,
     top_k: int,
 ) -> list[SearchResult]:
-    client = get_search_client()
-    hits = client.search(
+    backend = get_search_backend()
+    hits = backend.search(
+        query="",
         filters=active_filter_dict(filters),
         select=ALL_SELECT_FIELDS,
         top_k=top_k,
@@ -131,10 +132,9 @@ def _vector_search(
     top_k: int,
     similarity_threshold: float,
 ) -> list[SearchResult]:
-    client = get_search_client()
-    query_embedding = embed_single(query)
-    hits = client.search(
-        query_vector=query_embedding,
+    backend = get_search_backend()
+    hits = backend.search(
+        query=query,
         filters=active_filter_dict(filters) or None,
         select=ALL_SELECT_FIELDS,
         top_k=top_k,

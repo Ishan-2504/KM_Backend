@@ -9,3 +9,15 @@ google-genai
 faiss-cpu
 numpy
 pandas
+
+# ETL - document text extraction
+pymupdf
+python-docx
+python-pptx
+
+# Vertex AI Search / GCP (optional - only needed for the vertex backend)
+google-cloud-discoveryengine
+google-cloud-storage
+
+# Dev / testing
+pytest
